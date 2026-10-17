@@ -1,0 +1,44 @@
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+
+# Firebase Credentials (CRITICAL!)
+firebase-credentials.json
+*-firebase-adminsdk-*.json
+serviceAccountKey.json
+
+# Logs
+*.log
+server.log
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Database
+*.db
+*.sqlite3

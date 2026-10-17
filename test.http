@@ -1,0 +1,147 @@
+import json
+
+import requests
+from fastapi.testclient import TestClient
+
+from main import app
+
+BASE_URL = "http://127.0.0.1:8001"
+client = TestClient(app)
+
+
+def print_result(name, response):
+    print(f"\n{'='*60}")
+    print(f"🧪 {name}")
+    print(f"{'='*60}")
+    print(f"Status: {response.status_code}")
+    print(f"Response:\n{json.dumps(response.json(), indent=2)}")
+
+
+def test_health():
+    r = requests.get(f"{BASE_URL}/health")
+    print_result("Health Check", r)
+    assert r.status_code == 200
+    assert r.json()["status"] == "healthy"
+
+
+def test_high_risk():
+    r = requests.post(f"{BASE_URL}/risk-assessment", json={
+        "crop_name": "Tomato",
+        "quantity_kg": 100,
+        "offered_price_per_kg": 150,
+        "market_price_per_kg": 250,
+        "buyer_verified": False,
+        "payment_method": "after_delivery"
+    })
+    print_result("High Risk Scenario", r)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["risk_level"] == "High"
+    assert data["risk_score"] >= 70
+    print("✅ PASSED: High risk detected correctly")
+
+
+def test_medium_risk():
+    r = requests.post(f"{BASE_URL}/risk-assessment", json={
+        "crop_name": "Paddy",
+        "quantity_kg": 500,
+        "offered_price_per_kg": 220,
+        "market_price_per_kg": 250,
+        "buyer_verified": False,
+        "payment_method": "cash_on_delivery"
+    })
+    print_result("Medium Risk Scenario", r)
+    assert r.status_code == 200
+    print("✅ PASSED")
+
+
+def test_low_risk():
+    r = requests.post(f"{BASE_URL}/risk-assessment", json={
+        "crop_name": "Banana",
+        "quantity_kg": 50,
+        "offered_price_per_kg": 260,
+        "market_price_per_kg": 250,
+        "buyer_verified": True,
+        "payment_method": "advance"
+    })
+    print_result("Low Risk Scenario", r)
+    assert r.status_code == 200
+    assert r.json()["risk_level"] == "Low"
+    print("✅ PASSED: Low risk detected correctly")
+
+
+def test_validation_error():
+    r = requests.post(f"{BASE_URL}/risk-assessment", json={
+        "crop_name": "Tomato",
+        "quantity_kg": -10,
+        "offered_price_per_kg": 200,
+        "market_price_per_kg": 250,
+        "buyer_verified": True,
+        "payment_method": "advance"
+    })
+    print_result("Validation Error (negative qty)", r)
+    assert r.status_code == 422
+    print("✅ PASSED: Validation caught negative quantity")
+
+
+def test_invalid_payment_method():
+    r = requests.post(f"{BASE_URL}/risk-assessment", json={
+        "crop_name": "Tomato",
+        "quantity_kg": 100,
+        "offered_price_per_kg": 200,
+        "market_price_per_kg": 250,
+        "buyer_verified": True,
+        "payment_method": "bitcoin"
+    })
+    print_result("Validation Error (invalid payment)", r)
+    assert r.status_code == 422
+    print("✅ PASSED: Invalid payment method rejected")
+
+
+def test_crop_details_adds_document_id(monkeypatch):
+    class DummyDocumentRef:
+        def __init__(self):
+            self.id = "firestore-doc-123"
+            self.data = None
+
+        def set(self, data):
+            self.data = data
+
+    class DummyCollection:
+        def __init__(self):
+            self.doc = DummyDocumentRef()
+
+        def document(self):
+            return self.doc
+
+    class DummyDb:
+        def collection(self, _name):
+            return DummyCollection()
+
+    monkeypatch.setattr("main.get_firestore_db", lambda: DummyDb())
+
+    response = client.post(
+        "/crop-details",
+        json={
+            "cropName": "Tomato",
+            "quantityKg": 120,
+            "expectedPricePerKg": 45.5,
+            "farmer": "Farmer A",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["documentId"] == "firestore-doc-123"
+
+
+if __name__ == "__main__":
+    print("🚀 Starting API Tests...\n")
+    test_health()
+    test_high_risk()
+    test_medium_risk()
+    test_low_risk()
+    test_validation_error()
+    test_invalid_payment_method()
+    print(f"\n{'='*60}")
+    print("🎉 ALL TESTS PASSED!")
+    print(f"{'='*60}")
