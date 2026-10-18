@@ -1,7 +1,7 @@
 import logging
 import os
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import Any, Literal
 
 import bcrypt
@@ -123,7 +123,7 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None) -> s
     to_encode = data.copy()
     if expires_delta is None:
         expires_delta = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    expire = datetime.utcnow() + expires_delta
+    expire = datetime.now(timezone.utc) + expires_delta
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
@@ -247,7 +247,7 @@ def register_user(payload: UserRegister) -> UserOut:
         "password_hash": password_hash,
         "role": payload.role,
         "location": payload.location,
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
     db.collection("users").document(user_id).set(user_data)
@@ -484,7 +484,7 @@ def firebase_test():
         test_ref = db.collection("test").document("connection")
         test_ref.set({
             "status": "connected",
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "project": "crop-deal-risk-system",
         })
         
@@ -510,7 +510,7 @@ def save_crop_to_firestore(payload: CropDetailsRequest):
         data = {
             **payload.model_dump(),
             "crop_id": crop_id,
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
         }
         
         db.collection("cropListings").document(crop_id).set(data)
@@ -668,7 +668,7 @@ def assess_full(
         "financial_exposure": summary["financial_exposure"],
         "farmer_must_decide": True,
         "prototype": True,
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
     print(f"[DEBUG] Saving assessment: {assessment_id}")
@@ -779,7 +779,7 @@ def simulate_what_if(
         },
         "risk_score_change": risk_score_change,
         "recommendation_changed": recommendation_changed,
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
     db.collection("scenarios").document(scenario_id).set(scenario_data)
