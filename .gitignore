@@ -42,3 +42,10 @@ htmlcov/
 # Database
 *.db
 *.sqlite3
+
+# Firebase secrets (CRITICAL!)
+firebase-credentials.json
+firebase-credentials.json.old
+firebase-credentials.json.*
+*-firebase-adminsdk-*.json
+serviceAccountKey.json

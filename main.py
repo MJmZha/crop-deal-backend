@@ -262,7 +262,7 @@ def firebase_test():
         test_ref.set({
             "status": "connected",
             "timestamp": datetime.utcnow().isoformat(),
-            "project": "al-crop-risk-system",
+            "project": "crop-deal-risk-system",
         })
         
         doc = test_ref.get()
@@ -320,4 +320,134 @@ def list_crops_from_firestore():
         return {"status": "success", "count": len(crops), "crops": crops}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+class FullAssessmentRequest(BaseModel):
+    crop_name: str = Field(..., min_length=1)
+    quantity_kg: float = Field(..., gt=0)
+    offered_price_per_kg: float = Field(..., gt=0)
+    market_price_per_kg: float = Field(..., gt=0)
+    buyer_verified: bool
+    payment_method: Literal["advance", "cash_on_delivery", "after_delivery"]
+    distance_km: float = Field(default=0.0, ge=0)
+
+
+@app.post("/assess/full")
+def assess_full(payload: FullAssessmentRequest) -> dict[str, object]:
+    """Calculate a full prototype risk assessment and save it to Firestore."""
+    reasons: list[str] = []
+    risk_score = 0
+
+    offered_price = payload.offered_price_per_kg
+    market_price = payload.market_price_per_kg
+
+    if offered_price < market_price * 0.8:
+        risk_score += 35
+        reasons.append(
+            "Offered price is substantially below the current market price, which may signal a weak deal or possible manipulation."
+        )
+    elif offered_price < market_price:
+        risk_score += 20
+        reasons.append(
+            "Offered price is below the current market price, reducing expected profit and increasing deal risk."
+        )
+    else:
+        reasons.append(
+            "Offered price is at or above the market price, which is favorable and lowers risk."
+        )
+
+    if not payload.buyer_verified:
+        risk_score += 30
+        reasons.append("Buyer is not verified, which increases the risk of non-payment or fraud.")
+    else:
+        reasons.append("Buyer verification lowers the risk of default or scam behavior.")
+
+    if payload.payment_method == "cash_on_delivery":
+        risk_score += 25
+        reasons.append("Cash-on-delivery payment is riskier because payment may not be secured before delivery.")
+    elif payload.payment_method == "after_delivery":
+        risk_score += 18
+        reasons.append("After-delivery payment increases risk because payment may be delayed or disputed.")
+    else:
+        reasons.append("Advance payment is relatively safer because some payment is received upfront.")
+
+    if payload.distance_km > 50:
+        risk_score += 10
+        reasons.append("Distance exceeds 50 km, increasing the risk of delivery and coordination issues.")
+    else:
+        reasons.append("Distance is within the preferred range, reducing logistical risk.")
+
+    risk_score = max(0, min(100, risk_score))
+
+    if risk_score >= 70:
+        risk_level = "High"
+        recommendation = "REJECT"
+    elif risk_score >= 35:
+        risk_level = "Medium"
+        recommendation = "NEGOTIATE"
+    else:
+        risk_level = "Low"
+        recommendation = "ACCEPT"
+
+    financial_exposure = (
+        payload.quantity_kg
+        * payload.offered_price_per_kg
+        * (risk_score / 100)
+        * 0.3
+    )
+
+    if db is None:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "success": False,
+                "message": "Firebase is not connected. Set GOOGLE_APPLICATION_CREDENTIALS and Firebase configuration.",
+            },
+        )
+
+    assessment_id = str(uuid.uuid4())
+    data = {
+        "assessment_id": assessment_id,
+        "crop_name": payload.crop_name,
+        "quantity_kg": payload.quantity_kg,
+        "offered_price_per_kg": payload.offered_price_per_kg,
+        "market_price_per_kg": payload.market_price_per_kg,
+        "buyer_verified": payload.buyer_verified,
+        "payment_method": payload.payment_method,
+        "distance_km": payload.distance_km,
+        "risk_score": risk_score,
+        "risk_level": risk_level,
+        "recommendation": recommendation,
+        "financial_exposure": round(financial_exposure, 2),
+        "farmer_must_decide": True,
+        "prototype": True,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+    print(f"[DEBUG] Saving assessment: {assessment_id}")
+    print(f"[DEBUG] Data: {data}")
+    print(f"[DEBUG] DB: {db}")
+
+    try:
+        db.collection("assessments").document(assessment_id).set(data)
+        return {
+            "assessment_id": assessment_id,
+            "risk_score": risk_score,
+            "risk_level": risk_level,
+            "recommendation": recommendation,
+            "financial_exposure": round(financial_exposure, 2),
+            "reasons": reasons,
+            "farmer_must_decide": True,
+            "disclaimer": "Prototype rule-based assessment only",
+        }
+    except Exception as exc:
+        logger.exception("Failed to save assessment to Firestore.")
+        print(f"[ERROR] Firestore save failed for assessment {assessment_id}: {exc}")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "success": False,
+                "message": "Unable to save assessment right now. Please try again later.",
+            },
+        )
 
