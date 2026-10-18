@@ -1,16 +1,26 @@
 import logging
+import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Literal
 
-from fastapi import FastAPI, Request
+import bcrypt
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import JWTError, jwt
+from pydantic import AliasChoices, BaseModel, ConfigDict, EmailStr, Field
 
 from firebase_config import db
 
 logger = logging.getLogger(__name__)
+
+
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-here")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 1440
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 
 class CropDetailsRequest(BaseModel):
@@ -67,6 +77,121 @@ class RiskAssessmentRequest(BaseModel):
     payment_method: Literal["advance", "cash_on_delivery", "after_delivery"]
 
 
+class UserRegister(BaseModel):
+    name: str
+    email: EmailStr
+    password: str = Field(..., min_length=6)
+    role: Literal["farmer", "buyer", "admin"]
+    location: str
+
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class UserOut(BaseModel):
+    user_id: str
+    name: str
+    email: EmailStr
+    role: Literal["farmer", "buyer", "admin"]
+    location: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserOut
+
+
+def hash_password(password: str) -> str:
+    password_bytes = password.encode("utf-8")
+    if len(password_bytes) > 72:
+        password_bytes = password_bytes[:72]
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(password_bytes, salt).decode("utf-8")
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    password_bytes = plain.encode("utf-8")
+    if len(password_bytes) > 72:
+        password_bytes = password_bytes[:72]
+    return bcrypt.checkpw(password_bytes, hashed.encode("utf-8"))
+
+
+def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
+    to_encode = data.copy()
+    if expires_delta is None:
+        expires_delta = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.utcnow() + expires_delta
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def decode_token(token: str) -> dict:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("sub") is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return payload
+    except JWTError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+
+
+def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
+    payload = decode_token(token)
+    user_id = payload.get("sub")
+    if user_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if db is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Firebase is not connected.",
+        )
+
+    user_doc = db.collection("users").document(user_id).get()
+    if not user_doc.exists:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user_data = user_doc.to_dict() or {}
+    return {
+        "user_id": user_id,
+        "name": user_data.get("name"),
+        "email": user_data.get("email"),
+        "role": user_data.get("role"),
+        "location": user_data.get("location"),
+    }
+
+
+def require_role(role: str):
+    def role_dependency(user: dict = Depends(get_current_user)) -> dict:
+        if user.get("role") != role:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"This action requires the '{role}' role.",
+            )
+        return user
+
+    return role_dependency
+
+
 app = FastAPI(
     title="Crop Deal Risk Decision Support API",
     version="0.1.0",
@@ -90,6 +215,104 @@ def health() -> dict[str, str]:
         "status": "healthy",
         "message": "Server is running successfully.",
     }
+
+
+@app.post("/api/auth/register")
+def register_user(payload: UserRegister) -> UserOut:
+    """Register a new user and save their profile to Firestore."""
+    if db is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Firebase is not connected.",
+        )
+
+    existing_user = (
+        db.collection("users")
+        .where(field_path="email", op_string="==", value=payload.email)
+        .limit(1)
+        .stream()
+    )
+    if any(existing_user):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User with this email already exists.",
+        )
+
+    user_id = str(uuid.uuid4())
+    password_hash = hash_password(payload.password)
+    user_data = {
+        "user_id": user_id,
+        "name": payload.name,
+        "email": str(payload.email),
+        "password_hash": password_hash,
+        "role": payload.role,
+        "location": payload.location,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+    db.collection("users").document(user_id).set(user_data)
+
+    return UserOut(
+        user_id=user_id,
+        name=payload.name,
+        email=payload.email,
+        role=payload.role,
+        location=payload.location,
+    )
+
+
+@app.post("/api/auth/login")
+def login_user(form_data: OAuth2PasswordRequestForm = Depends()) -> TokenResponse:
+    """Authenticate a user and return a JWT access token."""
+    if db is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Firebase is not connected.",
+        )
+
+    users = (
+        db.collection("users")
+        .where(field_path="email", op_string="==", value=form_data.username)
+        .limit(1)
+        .stream()
+    )
+    user_doc = next(users, None)
+    if user_doc is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user_data = user_doc.to_dict()
+    if not verify_password(form_data.password, user_data.get("password_hash", "")):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token = create_access_token({"sub": user_data["user_id"], "role": user_data["role"]})
+    user_out = UserOut(
+        user_id=user_data["user_id"],
+        name=user_data["name"],
+        email=user_data["email"],
+        role=user_data["role"],
+        location=user_data["location"],
+    )
+    return TokenResponse(access_token=token, user=user_out)
+
+
+@app.get("/api/auth/me")
+def get_logged_in_user(user: dict = Depends(get_current_user)) -> UserOut:
+    """Fetch the currently authenticated user profile."""
+    return UserOut(
+        user_id=user["user_id"],
+        name=user["name"],
+        email=user["email"],
+        role=user["role"],
+        location=user["location"],
+    )
 
 
 @app.post("/crop-details")
@@ -333,7 +556,10 @@ class FullAssessmentRequest(BaseModel):
 
 
 @app.post("/assess/full")
-def assess_full(payload: FullAssessmentRequest) -> dict[str, object]:
+def assess_full(
+    payload: FullAssessmentRequest,
+    user: dict = Depends(get_current_user),
+) -> dict[str, object]:
     """Calculate a full prototype risk assessment and save it to Firestore."""
     reasons: list[str] = []
     risk_score = 0
@@ -408,6 +634,8 @@ def assess_full(payload: FullAssessmentRequest) -> dict[str, object]:
     assessment_id = str(uuid.uuid4())
     data = {
         "assessment_id": assessment_id,
+        "user_id": user.get("user_id"),
+        "user_role": user.get("role"),
         "crop_name": payload.crop_name,
         "quantity_kg": payload.quantity_kg,
         "offered_price_per_kg": payload.offered_price_per_kg,
