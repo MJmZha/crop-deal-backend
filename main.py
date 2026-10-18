@@ -2,7 +2,7 @@ import logging
 import os
 import uuid
 from datetime import datetime, timedelta
-from typing import Literal
+from typing import Any, Literal
 
 import bcrypt
 from fastapi import Depends, FastAPI, HTTPException, Request, status
@@ -555,12 +555,12 @@ class FullAssessmentRequest(BaseModel):
     distance_km: float = Field(default=0.0, ge=0)
 
 
-@app.post("/assess/full")
-def assess_full(
-    payload: FullAssessmentRequest,
-    user: dict = Depends(get_current_user),
-) -> dict[str, object]:
-    """Calculate a full prototype risk assessment and save it to Firestore."""
+class WhatIfRequest(BaseModel):
+    assessment_id: str
+    changes: dict[str, Any] = Field(default_factory=dict)
+
+
+def compute_assessment_result(payload: FullAssessmentRequest) -> dict[str, object]:
     reasons: list[str] = []
     risk_score = 0
 
@@ -622,6 +622,25 @@ def assess_full(
         * 0.3
     )
 
+    return {
+        "risk_score": risk_score,
+        "risk_level": risk_level,
+        "recommendation": recommendation,
+        "financial_exposure": round(financial_exposure, 2),
+        "reasons": reasons,
+        "farmer_must_decide": True,
+        "disclaimer": "Prototype rule-based assessment only",
+    }
+
+
+@app.post("/assess/full")
+def assess_full(
+    payload: FullAssessmentRequest,
+    user: dict = Depends(get_current_user),
+) -> dict[str, object]:
+    """Calculate a full prototype risk assessment and save it to Firestore."""
+    summary = compute_assessment_result(payload)
+
     if db is None:
         return JSONResponse(
             status_code=503,
@@ -643,10 +662,10 @@ def assess_full(
         "buyer_verified": payload.buyer_verified,
         "payment_method": payload.payment_method,
         "distance_km": payload.distance_km,
-        "risk_score": risk_score,
-        "risk_level": risk_level,
-        "recommendation": recommendation,
-        "financial_exposure": round(financial_exposure, 2),
+        "risk_score": summary["risk_score"],
+        "risk_level": summary["risk_level"],
+        "recommendation": summary["recommendation"],
+        "financial_exposure": summary["financial_exposure"],
         "farmer_must_decide": True,
         "prototype": True,
         "created_at": datetime.utcnow().isoformat(),
@@ -660,11 +679,11 @@ def assess_full(
         db.collection("assessments").document(assessment_id).set(data)
         return {
             "assessment_id": assessment_id,
-            "risk_score": risk_score,
-            "risk_level": risk_level,
-            "recommendation": recommendation,
-            "financial_exposure": round(financial_exposure, 2),
-            "reasons": reasons,
+            "risk_score": summary["risk_score"],
+            "risk_level": summary["risk_level"],
+            "recommendation": summary["recommendation"],
+            "financial_exposure": summary["financial_exposure"],
+            "reasons": summary["reasons"],
             "farmer_must_decide": True,
             "disclaimer": "Prototype rule-based assessment only",
         }
@@ -678,4 +697,100 @@ def assess_full(
                 "message": "Unable to save assessment right now. Please try again later.",
             },
         )
+
+
+@app.post("/simulate/whatif")
+def simulate_what_if(
+    payload: WhatIfRequest,
+    current_user: dict = Depends(get_current_user),
+) -> dict[str, object]:
+    """Run a simulated scenario against an existing assessment and save the result."""
+    if db is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Firebase is not connected.",
+        )
+
+    assessment_doc = db.collection("assessments").document(payload.assessment_id).get()
+    if not assessment_doc.exists:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Assessment not found.",
+        )
+
+    assessment = assessment_doc.to_dict() or {}
+    if assessment.get("user_id") != current_user.get("user_id"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only simulate your own assessment.",
+        )
+
+    original_inputs = {
+        "crop_name": assessment.get("crop_name"),
+        "quantity_kg": assessment.get("quantity_kg"),
+        "offered_price_per_kg": assessment.get("offered_price_per_kg"),
+        "market_price_per_kg": assessment.get("market_price_per_kg"),
+        "buyer_verified": assessment.get("buyer_verified"),
+        "payment_method": assessment.get("payment_method"),
+        "distance_km": assessment.get("distance_km", 0.0),
+    }
+
+    try:
+        original_payload = FullAssessmentRequest(**original_inputs)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Original assessment data is incomplete: {exc}",
+        ) from exc
+
+    updated_inputs = {**original_inputs, **payload.changes}
+    try:
+        updated_payload = FullAssessmentRequest(**updated_inputs)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid simulation changes: {exc}",
+        ) from exc
+
+    original_result = compute_assessment_result(original_payload)
+    updated_result = compute_assessment_result(updated_payload)
+
+    risk_score_change = updated_result["risk_score"] - original_result["risk_score"]
+    recommendation_changed = original_result["recommendation"] != updated_result["recommendation"]
+
+    scenario_id = str(uuid.uuid4())
+    scenario_data = {
+        "scenario_id": scenario_id,
+        "assessment_id": payload.assessment_id,
+        "user_id": current_user.get("user_id"),
+        "is_simulated": True,
+        "label": "⚠️ SIMULATED SCENARIO — not a real deal",
+        "original": {
+            **original_inputs,
+            "risk_score": original_result["risk_score"],
+            "risk_level": original_result["risk_level"],
+            "recommendation": original_result["recommendation"],
+        },
+        "updated": {
+            **updated_inputs,
+            "risk_score": updated_result["risk_score"],
+            "risk_level": updated_result["risk_level"],
+            "recommendation": updated_result["recommendation"],
+        },
+        "risk_score_change": risk_score_change,
+        "recommendation_changed": recommendation_changed,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+    db.collection("scenarios").document(scenario_id).set(scenario_data)
+
+    return {
+        "scenario_id": scenario_id,
+        "label": "⚠️ SIMULATED SCENARIO — not a real deal",
+        "original": scenario_data["original"],
+        "updated": scenario_data["updated"],
+        "risk_score_change": risk_score_change,
+        "recommendation_changed": recommendation_changed,
+        "is_simulated": True,
+    }
 
