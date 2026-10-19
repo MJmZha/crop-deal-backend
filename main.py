@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -102,6 +103,48 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserOut
+
+
+class LocationRequest(BaseModel):
+    from_location: str = Field(..., min_length=1)
+    to_location: str = Field(..., min_length=1)
+
+
+class DistanceResponse(BaseModel):
+    from_location: str
+    to_location: str
+    distance_km: float
+    estimated_transport_cost: float
+    duration_minutes: int
+
+
+cities = {
+    "Colombo": {"lat": 6.9271, "lng": 79.8612},
+    "Kandy": {"lat": 7.2906, "lng": 80.6337},
+    "Galle": {"lat": 6.0535, "lng": 80.2210},
+    "Jaffna": {"lat": 9.6615, "lng": 80.0255},
+    "Negombo": {"lat": 7.2083, "lng": 79.8358},
+    "Anuradhapura": {"lat": 8.3114, "lng": 80.4037},
+}
+
+
+def calculate_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Return the distance between two coordinates in kilometers using the Haversine formula."""
+    radius_km = 6371.0
+    lat1_rad = math.radians(lat1)
+    lon1_rad = math.radians(lng1)
+    lat2_rad = math.radians(lat2)
+    lon2_rad = math.radians(lng2)
+
+    dlat = lat2_rad - lat1_rad
+    dlon = lon2_rad - lon1_rad
+
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2) ** 2
+    )
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return radius_km * c
 
 
 def hash_password(password: str) -> str:
@@ -215,6 +258,44 @@ def health() -> dict[str, str]:
         "status": "healthy",
         "message": "Server is running successfully.",
     }
+
+
+@app.get("/api/location/cities")
+def get_supported_cities() -> dict[str, list[str]]:
+    """Return the list of cities supported for distance estimation."""
+    return {"cities": list(cities.keys())}
+
+
+@app.post("/api/location/distance", response_model=DistanceResponse)
+def get_distance_between_locations(payload: LocationRequest) -> DistanceResponse:
+    """Calculate the distance, transport cost, and travel duration between two cities."""
+    from_city = payload.from_location.strip().title()
+    to_city = payload.to_location.strip().title()
+
+    if from_city not in cities:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"City not found: {payload.from_location}",
+        )
+    if to_city not in cities:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"City not found: {payload.to_location}",
+        )
+
+    start = cities[from_city]
+    end = cities[to_city]
+    distance_km = calculate_distance(start["lat"], start["lng"], end["lat"], end["lng"])
+    estimated_transport_cost = distance_km * 50
+    duration_minutes = int((distance_km / 40) * 60)
+
+    return DistanceResponse(
+        from_location=from_city,
+        to_location=to_city,
+        distance_km=round(distance_km, 2),
+        estimated_transport_cost=round(estimated_transport_cost, 2),
+        duration_minutes=duration_minutes,
+    )
 
 
 @app.post("/api/auth/register")
