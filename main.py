@@ -545,6 +545,211 @@ def list_crops_from_firestore():
         return {"status": "error", "message": str(e)}
 
 
+def _normalize_listing_record(listing: dict[str, Any] | None, listing_id: str | None = None) -> dict[str, Any]:
+    normalized = dict(listing or {})
+    if listing_id is not None:
+        normalized.setdefault("listing_id", listing_id)
+    if "crop_name" not in normalized and "cropName" in normalized:
+        normalized["crop_name"] = normalized["cropName"]
+    if "cropName" not in normalized and "crop_name" in normalized:
+        normalized["cropName"] = normalized["crop_name"]
+    if "quantity_kg" not in normalized and "quantityKg" in normalized:
+        normalized["quantity_kg"] = normalized["quantityKg"]
+    if "quantityKg" not in normalized and "quantity_kg" in normalized:
+        normalized["quantityKg"] = normalized["quantity_kg"]
+    if "expected_price_per_kg" not in normalized and "offered_price_per_kg" in normalized:
+        normalized["expected_price_per_kg"] = normalized["offered_price_per_kg"]
+    if "offered_price_per_kg" not in normalized and "expected_price_per_kg" in normalized:
+        normalized["offered_price_per_kg"] = normalized["expected_price_per_kg"]
+    if "expectedPricePerKg" not in normalized and "expected_price_per_kg" in normalized:
+        normalized["expectedPricePerKg"] = normalized["expected_price_per_kg"]
+    if "offeredPricePerKg" not in normalized and "offered_price_per_kg" in normalized:
+        normalized["offeredPricePerKg"] = normalized["offered_price_per_kg"]
+    if "location" not in normalized and "farmLocation" in normalized:
+        normalized["location"] = normalized["farmLocation"]
+    if "farmLocation" not in normalized and "location" in normalized:
+        normalized["farmLocation"] = normalized["location"]
+    return normalized
+
+
+def _listing_can_access(listing: dict[str, Any], user: dict[str, Any]) -> bool:
+    owner_id = (
+        listing.get("farmer_id")
+        or listing.get("owner_id")
+        or listing.get("user_id")
+        or listing.get("farmerId")
+    )
+    if owner_id in (None, ""):
+        return True
+    if user.get("role") == "admin":
+        return True
+    return str(owner_id) == str(user.get("user_id"))
+
+
+def _get_listing_price(listing: dict[str, Any]) -> float | None:
+    for key in (
+        "offered_price_per_kg",
+        "expected_price_per_kg",
+        "offeredPricePerKg",
+        "expectedPricePerKg",
+    ):
+        value = listing.get(key)
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+@app.get("/api/listings/search")
+def search_listings(
+    crop: str | None = None,
+    min_price: float | None = None,
+    max_price: float | None = None,
+    location: str | None = None,
+    current_user: dict = Depends(get_current_user),
+) -> dict[str, object]:
+    """Search crop listings in memory using optional filters."""
+    if db is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Firebase is not connected.",
+        )
+
+    listings: list[dict[str, Any]] = []
+    for doc in db.collection("cropListings").stream():
+        listing = _normalize_listing_record(doc.to_dict() or {}, doc.id)
+        if not _listing_can_access(listing, current_user):
+            continue
+
+        if crop is not None:
+            crop_value = str(listing.get("crop_name") or listing.get("cropName") or "").strip().lower()
+            if crop_value != crop.strip().lower():
+                continue
+
+        price = _get_listing_price(listing)
+        if min_price is not None and (price is None or price < min_price):
+            continue
+        if max_price is not None and (price is None or price > max_price):
+            continue
+
+        if location is not None:
+            loc_value = str(listing.get("location") or "").strip().lower()
+            if loc_value != str(location).strip().lower():
+                continue
+
+        listings.append(listing)
+
+    return {"total": len(listings), "listings": listings}
+
+
+@app.get("/api/listings/{listing_id}")
+def get_listing_by_id(
+    listing_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Fetch a single listing and enforce ownership rules unless the owner field is missing."""
+    if db is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Firebase is not connected.",
+        )
+
+    doc = db.collection("cropListings").document(listing_id).get()
+    if not doc.exists:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Listing not found.",
+        )
+
+    listing = _normalize_listing_record(doc.to_dict() or {}, doc.id)
+    if not _listing_can_access(listing, current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to access this listing.",
+        )
+
+    return listing
+
+
+@app.put("/api/listings/{listing_id}")
+def update_listing_by_id(
+    listing_id: str,
+    payload: CropDetailsRequest,
+    current_user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Update a listing if the authenticated user owns it or the owner field is missing."""
+    if db is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Firebase is not connected.",
+        )
+
+    doc = db.collection("cropListings").document(listing_id).get()
+    if not doc.exists:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Listing not found.",
+        )
+
+    listing = _normalize_listing_record(doc.to_dict() or {}, doc.id)
+    if not _listing_can_access(listing, current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to update this listing.",
+        )
+
+    updated = dict(listing)
+    updated["crop_name"] = payload.crop_name
+    updated["cropName"] = payload.crop_name
+    updated["quantity_kg"] = payload.quantity_kg
+    updated["quantityKg"] = payload.quantity_kg
+    updated["expected_price_per_kg"] = payload.expected_price_per_kg
+    updated["expectedPricePerKg"] = payload.expected_price_per_kg
+    updated["offered_price_per_kg"] = payload.expected_price_per_kg
+    updated["offeredPricePerKg"] = payload.expected_price_per_kg
+    updated["location"] = payload.location
+    updated["farmLocation"] = payload.location
+    updated["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    if "farmer_id" not in updated and current_user.get("role") in {"farmer", "admin"}:
+        updated["farmer_id"] = current_user.get("user_id")
+
+    db.collection("cropListings").document(listing_id).set(updated)
+    return _normalize_listing_record(updated, listing_id)
+
+
+@app.delete("/api/listings/{listing_id}")
+def delete_listing_by_id(
+    listing_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> dict[str, str]:
+    """Delete a listing if the authenticated user owns it or the owner field is missing."""
+    if db is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Firebase is not connected.",
+        )
+
+    doc = db.collection("cropListings").document(listing_id).get()
+    if not doc.exists:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Listing not found.",
+        )
+
+    listing = _normalize_listing_record(doc.to_dict() or {}, doc.id)
+    if not _listing_can_access(listing, current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to delete this listing.",
+        )
+
+    doc.reference.delete()
+    return {"status": "success", "message": "Listing deleted"}
+
+
 class FullAssessmentRequest(BaseModel):
     crop_name: str = Field(..., min_length=1)
     quantity_kg: float = Field(..., gt=0)
