@@ -793,4 +793,312 @@ def simulate_what_if(
         "recommendation_changed": recommendation_changed,
         "is_simulated": True,
     }
+class BuyerRequirement(BaseModel):
+    crop_name: str = Field(..., min_length=1)
+    quantity_kg: float = Field(..., gt=0)
+    quality_grade: Literal["A", "B", "C", "Any"] = "Any"
+    max_price_per_kg: float = Field(..., gt=0)
+    location: str = Field(..., min_length=1)
+    deadline: str = Field(..., min_length=1)
+    notes: str = Field(default="")
 
+
+class BuyerRequirementOut(BuyerRequirement):
+    requirement_id: str
+    buyer_id: str
+    created_at: str
+
+
+class MatchingRequest(BaseModel):
+    requirement_id: str
+
+
+class MatchScoreRequest(BaseModel):
+    listing_id: str
+    requirement_id: str
+
+
+def calculate_match_score(listing: dict, requirement: dict) -> dict:
+    listing_crop = str(
+        listing.get("crop_name")
+        if listing.get("crop_name") is not None
+        else listing.get("cropName", "")
+    ).strip().lower()
+    requirement_crop = str(
+        requirement.get("crop_name")
+        if requirement.get("crop_name") is not None
+        else requirement.get("cropName", "")
+    ).strip().lower()
+
+    crop_score = 30 if listing_crop == requirement_crop and listing_crop else 0
+
+    listing_quantity = float(
+        listing.get("quantity_kg")
+        if listing.get("quantity_kg") is not None
+        else listing.get("quantityKg", 0.0)
+    )
+    requirement_quantity = float(
+        requirement.get("quantity_kg")
+        if requirement.get("quantity_kg") is not None
+        else requirement.get("quantityKg", 0.0)
+    )
+    quantity_score = 20 if listing_quantity >= requirement_quantity else 0
+
+    requirement_quality = str(requirement.get("quality_grade") or "Any").upper()
+    listing_quality = str(
+        listing.get("quality_grade")
+        if listing.get("quality_grade") is not None
+        else listing.get("qualityGrade", "Any")
+    ).upper()
+    quality_score = (
+        20 if requirement_quality == "ANY" or listing_quality == requirement_quality else 0
+    )
+
+    listing_price = float(
+        listing.get("offered_price_per_kg")
+        if listing.get("offered_price_per_kg") is not None
+        else listing.get("expected_price_per_kg")
+        if listing.get("expected_price_per_kg") is not None
+        else listing.get("expectedPricePerKg")
+        if listing.get("expectedPricePerKg") is not None
+        else listing.get("offeredPricePerKg", 0.0)
+    )
+    requirement_price = float(
+        requirement.get("max_price_per_kg")
+        if requirement.get("max_price_per_kg") is not None
+        else requirement.get("maxPricePerKg", 0.0)
+    )
+    price_score = 20 if listing_price <= requirement_price else 0
+
+    listing_location = str(listing.get("location") or "").strip().lower()
+    requirement_location = str(requirement.get("location") or "").strip().lower()
+    location_score = 10 if listing_location == requirement_location and listing_location else 0
+
+    score_breakdown = {
+        "crop_match": crop_score,
+        "quantity_match": quantity_score,
+        "quality_match": quality_score,
+        "price_match": price_score,
+        "location_match": location_score,
+    }
+
+    total_score = sum(score_breakdown.values())
+    reasons: list[str] = []
+
+    if crop_score > 0:
+        reasons.append("Crop matches the buyer requirement.")
+    else:
+        reasons.append("Crop does not match the buyer requirement.")
+
+    if quantity_score > 0:
+        reasons.append("Listed quantity is sufficient for the buyer requirement.")
+    else:
+        reasons.append("Listed quantity is below the buyer requirement.")
+
+    if quality_score > 0:
+        reasons.append("Quality requirement is satisfied.")
+    else:
+        reasons.append("Quality requirement is not satisfied.")
+
+    if price_score > 0:
+        reasons.append("Listing price is within the buyer's maximum price.")
+    else:
+        reasons.append("Listing price exceeds the buyer's maximum price.")
+
+    if location_score > 0:
+        reasons.append("Listing location matches the buyer's requirement location.")
+    else:
+        reasons.append("Listing location does not match the buyer's requirement location.")
+
+    return {
+        "match_score": round(float(total_score), 2),
+        "score_breakdown": score_breakdown,
+        "reasons": reasons,
+    }
+
+
+@app.post("/api/buyers/requirements", response_model=BuyerRequirementOut)
+def create_buyer_requirement(
+    payload: BuyerRequirement,
+    current_user: dict = Depends(get_current_user),
+) -> BuyerRequirementOut:
+    """Create a buyer requirement and save it to Firestore."""
+    if db is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Firebase is not connected.",
+        )
+
+    if current_user.get("role") != "buyer":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only buyers can create purchase requirements.",
+        )
+
+    requirement_id = str(uuid.uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
+    requirement_data = {
+        **payload.model_dump(),
+        "requirement_id": requirement_id,
+        "buyer_id": current_user.get("user_id"),
+        "created_at": created_at,
+    }
+
+    db.collection("buyers").document(requirement_id).set(requirement_data)
+    return BuyerRequirementOut(**requirement_data)
+
+
+@app.get("/api/buyers/requirements", response_model=list[BuyerRequirementOut])
+def get_buyer_requirements(
+    crop: str | None = None,
+    current_user: dict = Depends(get_current_user),
+) -> list[BuyerRequirementOut]:
+    """List buyer requirements. Optional crop filter."""
+    if db is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Firebase is not connected.",
+        )
+
+    requirement_docs = []
+    if crop:
+        requirement_docs = (
+            db.collection("buyers")
+            .where(field_path="crop_name", op_string="==", value=crop.strip())
+            .stream()
+        )
+    else:
+        requirement_docs = db.collection("buyers").stream()
+
+    results: list[BuyerRequirementOut] = []
+    for doc in requirement_docs:
+        data = doc.to_dict() or {}
+        if data:
+            results.append(BuyerRequirementOut(**data))
+    return results
+
+
+@app.get("/api/buyers/requirements/{requirement_id}", response_model=BuyerRequirementOut)
+def get_buyer_requirement_by_id(
+    requirement_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> BuyerRequirementOut:
+    """Get a single buyer requirement."""
+    if db is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Firebase is not connected.",
+        )
+
+    doc = db.collection("buyers").document(requirement_id).get()
+    if not doc.exists:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Buyer requirement not found.",
+        )
+
+    return BuyerRequirementOut(**(doc.to_dict() or {}))
+
+
+@app.post("/api/matching/find")
+def find_matching_listings(
+    payload: MatchingRequest,
+    current_user: dict = Depends(get_current_user),
+) -> dict[str, object]:
+    """Find crop listings that best match a buyer requirement."""
+    if db is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Firebase is not connected.",
+        )
+
+    requirement_doc = db.collection("buyers").document(payload.requirement_id).get()
+    if not requirement_doc.exists:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Buyer requirement not found.",
+        )
+
+    requirement = requirement_doc.to_dict() or {}
+    matches: list[dict[str, object]] = []
+
+    for listing_doc in db.collection("cropListings").stream():
+        listing = listing_doc.to_dict() or {}
+        if not listing:
+            continue
+
+        result = calculate_match_score(listing, requirement)
+        crop_score = result["score_breakdown"]["crop_match"]
+
+        if result["match_score"] > 0 and crop_score > 0:
+            matches.append(
+                {
+                    "listing_id": listing_doc.id,
+                    "match_score": result["match_score"],
+                    "score_breakdown": result["score_breakdown"],
+                    "reasons": result["reasons"],
+                    "listing": {
+                        "crop_name": listing.get("crop_name") or listing.get("cropName"),
+                        "quantity_kg": listing.get("quantity_kg")
+                        if listing.get("quantity_kg") is not None
+                        else listing.get("quantityKg"),
+                        "offered_price_per_kg": listing.get("offered_price_per_kg")
+                        if listing.get("offered_price_per_kg") is not None
+                        else listing.get("expected_price_per_kg")
+                        if listing.get("expected_price_per_kg") is not None
+                        else listing.get("expectedPricePerKg")
+                        if listing.get("expectedPricePerKg") is not None
+                        else listing.get("offeredPricePerKg"),
+                        "location": listing.get("location"),
+                        "farmer": listing.get("farmer"),
+                    },
+                }
+            )
+
+    matches.sort(key=lambda item: item["match_score"], reverse=True)
+
+    return {
+        "requirement_id": payload.requirement_id,
+        "total_matches": len(matches),
+        "matches": matches,
+    }
+
+
+@app.post("/api/matching/score")
+def get_single_match_score(
+    payload: MatchScoreRequest,
+    current_user: dict = Depends(get_current_user),
+) -> dict[str, object]:
+    """Return a detailed match score for one listing against one requirement."""
+    if db is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Firebase is not connected.",
+        )
+
+    requirement_doc = db.collection("buyers").document(payload.requirement_id).get()
+    if not requirement_doc.exists:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Buyer requirement not found.",
+        )
+
+    listing_doc = db.collection("cropListings").document(payload.listing_id).get()
+    if not listing_doc.exists:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Crop listing not found.",
+        )
+
+    result = calculate_match_score(
+        listing_doc.to_dict() or {},
+        requirement_doc.to_dict() or {},
+    )
+
+    return {
+        "listing_id": payload.listing_id,
+        "requirement_id": payload.requirement_id,
+        "match_score": result["match_score"],
+        "score_breakdown": result["score_breakdown"],
+        "reasons": result["reasons"],
+    }
